@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum JobStatus {
+  pending
+  completed
+  failed
+}
+
+model Node {
+  id         String      @id @default(uuid()) @db.Uuid
+  externalId String      @unique
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  results    JobResult[]
+
+  @@map("nodes")
+}
+
+model Job {
+  id         String      @id @default(uuid()) @db.Uuid
+  externalId String      @unique
+  type       String
+  target     String
+  status     JobStatus   @default(pending)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  results    JobResult[]
+
+  @@index([status])
+  @@map("jobs")
+}
+
+model JobResult {
+  id         String    @id @default(uuid()) @db.Uuid
+  nodeId     String?   @db.Uuid
+  jobId      String?   @db.Uuid
+  payload    Json
+  createdAt  DateTime  @default(now())
+  node       Node?     @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+  job        Job?      @relation(fields: [jobId], references: [id], onDelete: SetNull)
+
+  @@index([nodeId])
+  @@index([jobId])
+  @@map("job_results")
+}
