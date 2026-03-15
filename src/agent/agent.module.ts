@@ -13,6 +13,7 @@ import { AGENT_RESULTS_QUEUE } from '../queues/queue.constants';
     })
   ],
   controllers: [AgentController],
-  providers: [AgentService, AgentGateway]
+  providers: [AgentService, AgentGateway],
+  exports: [AgentGateway, AgentService]
 })
 export class AgentModule {}

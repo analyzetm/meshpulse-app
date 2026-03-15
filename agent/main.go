@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -86,6 +87,13 @@ type wsEnvelope struct {
 	NodeID          string `json:"nodeId,omitempty"`
 	Challenge       string `json:"challenge,omitempty"`
 	Signature       string `json:"signature,omitempty"`
+	ExecutionID     string `json:"executionId,omitempty"`
+	AssignmentID    string `json:"assignmentId,omitempty"`
+	Target          string `json:"target,omitempty"`
+	CheckType       string `json:"checkType,omitempty"`
+	Role            string `json:"role,omitempty"`
+	ResultStatus    string `json:"resultStatus,omitempty"`
+	LatencyMs       int64  `json:"latencyMs,omitempty"`
 	ServerPublicKey string `json:"serverPublicKey,omitempty"`
 	Reason          string `json:"reason,omitempty"`
 	TS              int64  `json:"ts,omitempty"`
@@ -369,6 +377,8 @@ func connectAndServe(cfg config, st *state) error {
 		switch message.Type {
 		case "heartbeat_ack":
 			log.Printf("heartbeat acknowledged for node %s", cfg.NodeID)
+		case "assignment":
+			go handleAssignment(session, cfg, message)
 		case "challenge":
 			log.Printf("received unexpected challenge after auth for node %s", cfg.NodeID)
 		case "auth_error":
@@ -378,6 +388,77 @@ func connectAndServe(cfg config, st *state) error {
 			log.Printf("received message type %q", message.Type)
 		}
 	}
+}
+
+func handleAssignment(session *wsSession, cfg config, message wsEnvelope) {
+	if message.AssignmentID == "" || message.Target == "" || message.CheckType == "" {
+		log.Printf("received invalid assignment payload nodeId=%s", cfg.NodeID)
+		return
+	}
+
+	log.Printf(
+		"assignment received nodeId=%s executionId=%s assignmentId=%s target=%s checkType=%s role=%s",
+		cfg.NodeID,
+		emptyIfMissing(message.ExecutionID),
+		message.AssignmentID,
+		message.Target,
+		message.CheckType,
+		message.Role,
+	)
+
+	if err := session.writeJSON(wsEnvelope{
+		Type:         "assignment_ack",
+		NodeID:       cfg.NodeID,
+		ExecutionID:  message.ExecutionID,
+		AssignmentID: message.AssignmentID,
+	}); err != nil {
+		log.Printf("failed to send assignment ack nodeId=%s assignmentId=%s err=%v", cfg.NodeID, message.AssignmentID, err)
+		return
+	}
+
+	resultStatus, latencyMs := executeTCPCheck(message.Target, 5*time.Second)
+	if err := session.writeJSON(wsEnvelope{
+		Type:         "result",
+		NodeID:       cfg.NodeID,
+		ExecutionID:  message.ExecutionID,
+		AssignmentID: message.AssignmentID,
+		ResultStatus: resultStatus,
+		LatencyMs:    latencyMs,
+	}); err != nil {
+		log.Printf("failed to send result nodeId=%s assignmentId=%s err=%v", cfg.NodeID, message.AssignmentID, err)
+		return
+	}
+
+	log.Printf(
+		"result sent nodeId=%s assignmentId=%s resultStatus=%s latencyMs=%d",
+		cfg.NodeID,
+		message.AssignmentID,
+		resultStatus,
+		latencyMs,
+	)
+}
+
+func emptyIfMissing(value string) string {
+	if value == "" {
+		return "n/a"
+	}
+
+	return value
+}
+
+func executeTCPCheck(target string, timeout time.Duration) (string, int64) {
+	startedAt := time.Now()
+	conn, err := net.DialTimeout("tcp", target, timeout)
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return "timeout", 0
+		}
+		return "error", 0
+	}
+	defer conn.Close()
+
+	return "up", time.Since(startedAt).Milliseconds()
 }
 
 func completeWSAuth(session *wsSession, cfg config, st *state) (bool, error) {

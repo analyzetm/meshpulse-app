@@ -217,6 +217,151 @@ export class AgentService {
     });
   }
 
+  async markJobRunning(jobId: string, nodeId: string) {
+    await this.prisma.job.update({
+      where: {
+        id: jobId
+      },
+      data: {
+        status: 'running',
+        assignedNodeId: nodeId
+      }
+    });
+
+    this.logger.log(`job marked running jobId=${jobId} nodeId=${nodeId}`);
+  }
+
+  async markCheckAssignmentRunning(
+    executionId: string,
+    assignmentId: string,
+    nodeId: string
+  ) {
+    await this.prisma.checkAssignment.update({
+      where: {
+        id: assignmentId
+      },
+      data: {
+        status: 'running',
+        nodeId
+      }
+    });
+
+    this.logger.log(
+      `check assignment marked running executionId=${executionId} assignmentId=${assignmentId} nodeId=${nodeId}`
+    );
+  }
+
+  async markCheckAssignmentFailed(executionId: string, assignmentId: string) {
+    await this.prisma.checkAssignment.update({
+      where: {
+        id: assignmentId
+      },
+      data: {
+        status: 'failed'
+      }
+    });
+
+    await this.finalizeExecutionIfReady(executionId);
+  }
+
+  async storeAssignmentResult(
+    jobId: string,
+    nodeId: string,
+    resultStatus: string,
+    latencyMs?: number
+  ) {
+    await this.prisma.job.findUniqueOrThrow({
+      where: {
+        id: jobId
+      }
+    });
+
+    await this.prisma.jobResult.create({
+      data: {
+        jobId,
+        nodeId,
+        status: resultStatus,
+        latencyMs
+      }
+    });
+    this.logger.log(
+      `job result stored jobId=${jobId} nodeId=${nodeId} resultStatus=${resultStatus} latencyMs=${latencyMs ?? 'n/a'}`
+    );
+
+    await this.prisma.job.update({
+      where: {
+        id: jobId
+      },
+      data: {
+        status: 'finished'
+      }
+    });
+    this.logger.log(`job marked finished jobId=${jobId} nodeId=${nodeId}`);
+  }
+
+  async storeCheckResult(
+    executionId: string,
+    assignmentId: string,
+    nodeId: string,
+    resultStatus: string,
+    latencyMs: number | undefined,
+    activeNodeIds: string[]
+  ) {
+    const assignment = await this.prisma.checkAssignment.findUniqueOrThrow({
+      where: {
+        id: assignmentId
+      },
+      include: {
+        execution: {
+          include: {
+            checkDefinition: true,
+            assignments: true,
+            results: true
+          }
+        }
+      }
+    });
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.checkResult.create({
+        data: {
+          executionId,
+          assignmentId,
+          nodeId,
+          status: resultStatus,
+          latencyMs
+        }
+      });
+
+      await tx.checkAssignment.update({
+        where: {
+          id: assignmentId
+        },
+        data: {
+          status: 'completed'
+        }
+      });
+    });
+
+    this.logger.log(
+      `check result stored executionId=${executionId} assignmentId=${assignmentId} nodeId=${nodeId} resultStatus=${resultStatus} latencyMs=${latencyMs ?? 'n/a'}`
+    );
+
+    const dispatches =
+      assignment.role === 'primary'
+        ? await this.maybeCreateValidationAssignments(
+            assignment.execution.checkDefinitionId,
+            executionId,
+            assignment.nodeId,
+            resultStatus,
+            activeNodeIds
+          )
+        : [];
+
+    await this.finalizeExecutionIfReady(executionId);
+    return dispatches;
+  }
+
   async queueJobResult(payload: Record<string, unknown>) {
     this.logger.log(
       `Queueing result job to ${AGENT_RESULTS_QUEUE}: ${JSON.stringify(payload)}`
@@ -281,6 +426,211 @@ export class AgentService {
     }
 
     return null;
+  }
+
+  private async maybeCreateValidationAssignments(
+    checkDefinitionId: string,
+    executionId: string,
+    primaryNodeId: string,
+    resultStatus: string,
+    activeNodeIds: string[]
+  ) {
+    const execution = await this.prisma.checkExecution.findUniqueOrThrow({
+      where: {
+        id: executionId
+      },
+      include: {
+        checkDefinition: true,
+        assignments: true
+      }
+    });
+
+    const { checkDefinition } = execution;
+    const shouldTriggerValidation =
+      checkDefinition.validationMode === 'always' ||
+      (checkDefinition.validationMode === 'on_failure' && resultStatus !== 'up');
+
+    if (!shouldTriggerValidation || checkDefinition.validationMode === 'never') {
+      return [];
+    }
+
+    const existingValidationCount = execution.assignments.filter(
+      (assignment) => assignment.role === 'validation'
+    ).length;
+
+    if (existingValidationCount > 0) {
+      return [];
+    }
+
+    this.logger.log(
+      `validation triggered executionId=${executionId} checkDefinitionId=${checkDefinitionId} primaryNodeId=${primaryNodeId} resultStatus=${resultStatus}`
+    );
+
+    const excludedNodeIds = execution.assignments.map((assignment) => assignment.nodeId);
+    const selectedNodes = await this.selectNodesForCheck({
+      activeNodeIds,
+      excludeNodeIds: excludedNodeIds,
+      requiredRegion: checkDefinition.requiredRegion,
+      limit: checkDefinition.validationCount
+    });
+
+    if (selectedNodes.length === 0) {
+      this.logger.warn(
+        `no online node available for validation executionId=${executionId}`
+      );
+      return [];
+    }
+
+    this.logger.log(
+      `nodes selected executionId=${executionId} nodeIds=${selectedNodes
+        .map((node) => node.nodeId)
+        .join(',')}`
+    );
+
+    const createdAssignments = await Promise.all(
+      selectedNodes.map((node) =>
+        this.prisma.checkAssignment.create({
+          data: {
+            executionId,
+            nodeId: node.nodeId,
+            role: 'validation',
+            status: 'assigned'
+          }
+        })
+      )
+    );
+
+    this.logger.log(
+      `validation assignments created executionId=${executionId} count=${createdAssignments.length}`
+    );
+
+    return createdAssignments.map((assignment) => ({
+      executionId,
+      assignmentId: assignment.id,
+      nodeId: assignment.nodeId,
+      target: checkDefinition.target,
+      checkType: checkDefinition.type,
+      role: 'validation' as const
+    }));
+  }
+
+  async selectNodesForCheck(params: {
+    activeNodeIds: string[];
+    excludeNodeIds?: string[];
+    requiredRegion?: string | null;
+    limit: number;
+  }) {
+    const { activeNodeIds, excludeNodeIds = [], requiredRegion, limit } = params;
+
+    if (activeNodeIds.length === 0 || limit <= 0) {
+      return [];
+    }
+
+    const candidateNodes = await this.prisma.node.findMany({
+      where: {
+        nodeId: {
+          in: activeNodeIds,
+          notIn: excludeNodeIds
+        },
+        status: 'active',
+        isOnline: true,
+        ...(requiredRegion ? { region: requiredRegion } : {})
+      },
+      select: {
+        nodeId: true,
+        lastSeenAt: true
+      }
+    });
+
+    const rankedNodes = await Promise.all(
+      candidateNodes.map(async (node) => {
+        const [activeAssignments, latestAssignment] = await Promise.all([
+          this.prisma.checkAssignment.count({
+            where: {
+              nodeId: node.nodeId,
+              status: {
+                in: ['assigned', 'running']
+              }
+            }
+          }),
+          this.prisma.checkAssignment.findFirst({
+            where: {
+              nodeId: node.nodeId
+            },
+            orderBy: {
+              createdAt: 'desc'
+            },
+            select: {
+              createdAt: true
+            }
+          })
+        ]);
+
+        return {
+          nodeId: node.nodeId,
+          lastSeenAt: node.lastSeenAt?.getTime() ?? 0,
+          activeAssignments,
+          lastAssignedAt: latestAssignment?.createdAt.getTime() ?? 0
+        };
+      })
+    );
+
+    return rankedNodes
+      .filter((node) => node.activeAssignments === 0)
+      .sort((left, right) => {
+        if (left.lastAssignedAt !== right.lastAssignedAt) {
+          return left.lastAssignedAt - right.lastAssignedAt;
+        }
+
+        return right.lastSeenAt - left.lastSeenAt;
+      })
+      .slice(0, limit);
+  }
+
+  async finalizeExecutionIfReady(executionId: string) {
+    const execution = await this.prisma.checkExecution.findUniqueOrThrow({
+      where: {
+        id: executionId
+      },
+      include: {
+        assignments: true,
+        results: true
+      }
+    });
+
+    const hasPendingAssignments = execution.assignments.some((assignment) =>
+      ['assigned', 'running'].includes(assignment.status)
+    );
+
+    if (hasPendingAssignments) {
+      return null;
+    }
+
+    const upCount = execution.results.filter((result) => result.status === 'up').length;
+    const downCount = execution.results.length - upCount;
+
+    let consensusStatus = 'mixed';
+    if (upCount > downCount) {
+      consensusStatus = 'up';
+    } else if (downCount > upCount) {
+      consensusStatus = 'down';
+    }
+
+    await this.prisma.checkExecution.update({
+      where: {
+        id: executionId
+      },
+      data: {
+        status: 'completed',
+        consensusStatus
+      }
+    });
+
+    this.logger.log(
+      `consensus decision executionId=${executionId} consensusStatus=${consensusStatus} upCount=${upCount} downCount=${downCount}`
+    );
+
+    return consensusStatus;
   }
 
   private requireNodeId(body: Record<string, unknown>) {

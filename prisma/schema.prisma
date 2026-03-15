@@ -26,6 +26,8 @@ model Node {
   reputationScore       Int         @default(0)
   createdAt             DateTime    @default(now())
   results               JobResult[]
+  checkAssignments      CheckAssignment[]
+  checkResults          CheckResult[]
 
   @@map("nodes")
 }
@@ -53,4 +55,65 @@ model JobResult {
   node      Node     @relation(fields: [nodeId], references: [nodeId], onDelete: Cascade)
 
   @@map("job_results")
+}
+
+model CheckDefinition {
+  id             String           @id @default(uuid()) @db.Uuid
+  type           String
+  target         String
+  intervalSec    Int
+  isActive       Boolean          @default(true)
+  nextRunAt      DateTime
+  validationMode String           @default("on_failure")
+  validationCount Int             @default(2)
+  requiredRegion String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  executions     CheckExecution[]
+
+  @@map("check_definitions")
+}
+
+model CheckExecution {
+  id              String            @id @default(uuid()) @db.Uuid
+  checkDefinitionId String          @db.Uuid
+  status          String            @default("pending")
+  consensusStatus String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  checkDefinition CheckDefinition   @relation(fields: [checkDefinitionId], references: [id], onDelete: Cascade)
+  assignments     CheckAssignment[]
+  results         CheckResult[]
+
+  @@map("check_executions")
+}
+
+model CheckAssignment {
+  id          String         @id @default(uuid()) @db.Uuid
+  executionId String         @db.Uuid
+  nodeId      String
+  role        String
+  status      String         @default("assigned")
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  execution   CheckExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  node        Node           @relation(fields: [nodeId], references: [nodeId], onDelete: Cascade)
+  result      CheckResult?
+
+  @@map("check_assignments")
+}
+
+model CheckResult {
+  id           String         @id @default(uuid()) @db.Uuid
+  executionId  String         @db.Uuid
+  assignmentId String         @unique @db.Uuid
+  nodeId       String
+  status       String
+  latencyMs    Int?
+  createdAt    DateTime       @default(now())
+  execution    CheckExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  assignment   CheckAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  node         Node           @relation(fields: [nodeId], references: [nodeId], onDelete: Cascade)
+
+  @@map("check_results")
 }

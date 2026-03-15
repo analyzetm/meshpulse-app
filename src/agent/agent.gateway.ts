@@ -19,6 +19,13 @@ type AgentMessage = {
   nodeId?: unknown;
   signature?: unknown;
   ts?: unknown;
+  executionId?: unknown;
+  assignmentId?: unknown;
+  target?: unknown;
+  checkType?: unknown;
+  role?: unknown;
+  resultStatus?: unknown;
+  latencyMs?: unknown;
 };
 
 @Injectable()
@@ -36,6 +43,70 @@ export class AgentGateway
 
   afterInit() {
     this.logger.log('agent gateway ready path=/agent/ws');
+  }
+
+  hasActiveSession(nodeId: string) {
+    const client = this.activeSockets.get(nodeId);
+    const session = client ? this.sessions.get(client) : undefined;
+
+    return Boolean(
+      client &&
+        session?.authenticated &&
+        session.nodeId === nodeId &&
+        client.readyState === WebSocket.OPEN
+    );
+  }
+
+  listActiveNodeIds() {
+    return [...this.activeSockets.entries()]
+      .filter(([nodeId, client]) => {
+        const session = this.sessions.get(client);
+        return (
+          client.readyState === WebSocket.OPEN &&
+          session?.authenticated === true &&
+          session.nodeId === nodeId
+        );
+      })
+      .map(([nodeId]) => nodeId);
+  }
+
+  sendTestAssignment(
+    nodeId: string,
+    executionId: string | null,
+    assignmentId: string,
+    target: string,
+    checkType: string,
+    role: 'primary' | 'validation' = 'primary'
+  ) {
+    const client = this.activeSockets.get(nodeId);
+    const session = client ? this.sessions.get(client) : undefined;
+
+    if (!client || !session?.authenticated || client.readyState !== WebSocket.OPEN) {
+      this.logger.warn(`node offline for assignment nodeId=${nodeId}`);
+      return {
+        ok: false,
+        sent: false,
+        error: 'NODE_OFFLINE'
+      } as const;
+    }
+
+    this.send(client, {
+      type: 'assignment',
+      executionId: executionId ?? undefined,
+      assignmentId,
+      target,
+      checkType,
+      role
+    });
+    this.logger.log(
+      `assignment sent to node nodeId=${nodeId} executionId=${executionId ?? 'n/a'} assignmentId=${assignmentId} target=${target} checkType=${checkType} role=${role}`
+    );
+
+    return {
+      ok: true,
+      sent: true,
+      assignmentId
+    } as const;
   }
 
   handleConnection(client: WebSocket) {
@@ -92,6 +163,12 @@ export class AgentGateway
         return;
       case 'heartbeat':
         await this.handleHeartbeat(client, parsed);
+        return;
+      case 'assignment_ack':
+        await this.handleAssignmentAck(client, parsed);
+        return;
+      case 'result':
+        await this.handleResult(client, parsed);
         return;
       default:
         this.logger.warn(`Unknown agent message type received: ${type || '<empty>'}`);
@@ -206,6 +283,89 @@ export class AgentGateway
     this.send(client, {
       type: 'heartbeat_ack'
     });
+  }
+
+  private async handleAssignmentAck(client: WebSocket, message: AgentMessage) {
+    const executionId =
+      typeof message.executionId === 'string' ? message.executionId : '';
+    const assignmentId =
+      typeof message.assignmentId === 'string' ? message.assignmentId : '';
+    const nodeId = this.sessions.get(client)?.nodeId ?? '';
+
+    if (!assignmentId || !nodeId) {
+      return;
+    }
+
+    this.logger.log(
+      `assignment ack received nodeId=${nodeId} assignmentId=${assignmentId}`
+    );
+    if (executionId) {
+      await this.agentService.markCheckAssignmentRunning(
+        executionId,
+        assignmentId,
+        nodeId
+      );
+      return;
+    }
+
+    await this.agentService.markJobRunning(assignmentId, nodeId);
+  }
+
+  private async handleResult(client: WebSocket, message: AgentMessage) {
+    const executionId =
+      typeof message.executionId === 'string' ? message.executionId : '';
+    const assignmentId =
+      typeof message.assignmentId === 'string' ? message.assignmentId : '';
+    const nodeId = this.sessions.get(client)?.nodeId ?? '';
+    const resultStatus =
+      typeof message.resultStatus === 'string' ? message.resultStatus : '';
+    const latencyMs =
+      typeof message.latencyMs === 'number' ? message.latencyMs : undefined;
+
+    if (!assignmentId || !nodeId || !resultStatus) {
+      return;
+    }
+
+    this.logger.log(
+      `result received nodeId=${nodeId} executionId=${executionId || 'n/a'} assignmentId=${assignmentId} resultStatus=${resultStatus} latencyMs=${latencyMs ?? 'n/a'}`
+    );
+    if (executionId) {
+      const dispatches = await this.agentService.storeCheckResult(
+        executionId,
+        assignmentId,
+        nodeId,
+        resultStatus,
+        latencyMs,
+        this.listActiveNodeIds()
+      );
+
+      for (const dispatch of dispatches) {
+        const sent = this.sendTestAssignment(
+          dispatch.nodeId,
+          dispatch.executionId,
+          dispatch.assignmentId,
+          dispatch.target,
+          dispatch.checkType,
+          dispatch.role
+        );
+
+        if (!sent.sent) {
+          await this.agentService.markCheckAssignmentFailed(
+            dispatch.executionId,
+            dispatch.assignmentId
+          );
+        }
+      }
+
+      return;
+    }
+
+    await this.agentService.storeAssignmentResult(
+      assignmentId,
+      nodeId,
+      resultStatus,
+      latencyMs
+    );
   }
 
   private send(client: WebSocket, payload: Record<string, unknown>) {

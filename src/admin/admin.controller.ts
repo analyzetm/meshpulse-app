@@ -15,4 +15,14 @@ export class AdminController {
   createNode(@Body() body: Record<string, unknown>) {
     return this.adminService.createNode(body);
   }
+
+  @Post('test-assignment')
+  testAssignment(@Body() body: Record<string, unknown>) {
+    return this.adminService.sendTestAssignment(body);
+  }
+
+  @Post('check-definitions')
+  createCheckDefinition(@Body() body: Record<string, unknown>) {
+    return this.adminService.createCheckDefinition(body);
+  }
 }

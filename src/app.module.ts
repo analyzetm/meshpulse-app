@@ -6,6 +6,7 @@ import { AgentModule } from './agent/agent.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { AgentResultsProcessor } from './queues/agent-results.processor';
 import { AGENT_RESULTS_QUEUE } from './queues/queue.constants';
+import { SchedulerModule } from './scheduler/scheduler.module';
 import { SecurityModule } from './security/security.module';
 
 @Module({
@@ -22,7 +23,8 @@ import { SecurityModule } from './security/security.module';
       name: AGENT_RESULTS_QUEUE
     }),
     AdminModule,
-    AgentModule
+    AgentModule,
+    SchedulerModule
   ],
   providers: [AgentResultsProcessor]
 })
