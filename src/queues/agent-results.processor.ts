@@ -67,7 +67,8 @@ export class AgentResultsProcessor extends WorkerHost {
           },
           data: {
             lastSeenAt: new Date(),
-            status: 'active'
+            status: 'online',
+            isOnline: true
           }
         }),
         this.prisma.job.update({

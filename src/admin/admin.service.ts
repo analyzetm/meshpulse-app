@@ -115,6 +115,15 @@ export class AdminService {
       typeof body.validationCount === 'number' ? body.validationCount : 2;
     const requiredRegion =
       typeof body.requiredRegion === 'string' ? body.requiredRegion.trim() : '';
+    const minReputation =
+      typeof body.minReputation === 'number' ? body.minReputation : undefined;
+    const maxReputation =
+      typeof body.maxReputation === 'number' ? body.maxReputation : undefined;
+    const preferTrusted = body.preferTrusted === true;
+    const requireTrusted = body.requireTrusted === true;
+    const preferDifferentAsn =
+      body.preferDifferentAsn === undefined ? true : body.preferDifferentAsn === true;
+    const preferDifferentRegion = body.preferDifferentRegion === true;
 
     if (!type || !target || !Number.isFinite(intervalSec) || intervalSec <= 0) {
       throw new BadRequestException(
@@ -132,6 +141,28 @@ export class AdminService {
       throw new BadRequestException('validationCount must be zero or greater');
     }
 
+    if (
+      minReputation !== undefined &&
+      (!Number.isFinite(minReputation) || minReputation < 0 || minReputation > 100)
+    ) {
+      throw new BadRequestException('minReputation must be between 0 and 100');
+    }
+
+    if (
+      maxReputation !== undefined &&
+      (!Number.isFinite(maxReputation) || maxReputation < 0 || maxReputation > 100)
+    ) {
+      throw new BadRequestException('maxReputation must be between 0 and 100');
+    }
+
+    if (
+      minReputation !== undefined &&
+      maxReputation !== undefined &&
+      minReputation > maxReputation
+    ) {
+      throw new BadRequestException('minReputation must be less than or equal to maxReputation');
+    }
+
     const checkDefinition = await this.prisma.checkDefinition.create({
       data: {
         type,
@@ -140,6 +171,12 @@ export class AdminService {
         validationMode,
         validationCount,
         requiredRegion: requiredRegion || undefined,
+        minReputation,
+        maxReputation,
+        preferTrusted,
+        requireTrusted,
+        preferDifferentAsn,
+        preferDifferentRegion,
         nextRunAt: new Date()
       }
     });

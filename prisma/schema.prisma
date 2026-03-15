@@ -13,6 +13,20 @@ model Node {
   ownerUserId           String?
   status                String      @default("pending_registration")
   isOnline              Boolean     @default(false)
+  isTrusted             Boolean     @default(false)
+  trustLevel            String      @default("community")
+  remoteIp              String?
+  ipVersion             Int?
+  countryCode           String?
+  regionCode            String?
+  city                  String?
+  asn                   Int?
+  ispOrOrg              String?
+  connectedAt           DateTime?
+  checksToday           Int         @default(0)
+  checksLastHour        Int         @default(0)
+  lastAssignedAt        DateTime?
+  validationAccuracy    Float?
   claimTokenHash        String?
   claimTokenUsedAt      DateTime?
   publicKey             String?
@@ -23,11 +37,12 @@ model Node {
   hardwareRaw           Json?
   hardwareFingerprint   String?
   region                String?
-  reputationScore       Int         @default(0)
+  reputationScore       Int         @default(50)
   createdAt             DateTime    @default(now())
   results               JobResult[]
   checkAssignments      CheckAssignment[]
   checkResults          CheckResult[]
+  reputationEvents      NodeReputationEvent[]
 
   @@map("nodes")
 }
@@ -58,18 +73,24 @@ model JobResult {
 }
 
 model CheckDefinition {
-  id             String           @id @default(uuid()) @db.Uuid
-  type           String
-  target         String
-  intervalSec    Int
-  isActive       Boolean          @default(true)
-  nextRunAt      DateTime
-  validationMode String           @default("on_failure")
-  validationCount Int             @default(2)
-  requiredRegion String?
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime         @updatedAt
-  executions     CheckExecution[]
+  id                    String           @id @default(uuid()) @db.Uuid
+  type                  String
+  target                String
+  intervalSec           Int
+  isActive              Boolean          @default(true)
+  nextRunAt             DateTime
+  validationMode        String           @default("on_failure")
+  validationCount       Int              @default(2)
+  requiredRegion        String?
+  minReputation         Int?
+  maxReputation         Int?
+  preferTrusted         Boolean          @default(false)
+  requireTrusted        Boolean          @default(false)
+  preferDifferentAsn    Boolean          @default(true)
+  preferDifferentRegion Boolean          @default(false)
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+  executions            CheckExecution[]
 
   @@map("check_definitions")
 }
@@ -84,6 +105,7 @@ model CheckExecution {
   checkDefinition CheckDefinition   @relation(fields: [checkDefinitionId], references: [id], onDelete: Cascade)
   assignments     CheckAssignment[]
   results         CheckResult[]
+  reputationEvents NodeReputationEvent[]
 
   @@map("check_executions")
 }
@@ -99,6 +121,7 @@ model CheckAssignment {
   execution   CheckExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
   node        Node           @relation(fields: [nodeId], references: [nodeId], onDelete: Cascade)
   result      CheckResult?
+  reputationEvents NodeReputationEvent[]
 
   @@map("check_assignments")
 }
@@ -116,4 +139,21 @@ model CheckResult {
   node         Node           @relation(fields: [nodeId], references: [nodeId], onDelete: Cascade)
 
   @@map("check_results")
+}
+
+model NodeReputationEvent {
+  id           String          @id @default(uuid()) @db.Uuid
+  nodeId       String
+  executionId  String?         @db.Uuid
+  assignmentId String?         @db.Uuid
+  eventType    String
+  scoreDelta   Int
+  reason       String
+  createdAt    DateTime        @default(now())
+  node         Node            @relation(fields: [nodeId], references: [nodeId], onDelete: Cascade)
+  execution    CheckExecution? @relation(fields: [executionId], references: [id], onDelete: SetNull)
+  assignment   CheckAssignment? @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+
+  @@unique([assignmentId, eventType])
+  @@map("node_reputation_events")
 }

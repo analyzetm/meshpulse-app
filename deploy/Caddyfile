@@ -3,6 +3,11 @@
 }
 
 api.pulseofmesh.app {
+	handle_path /downloads/* {
+		root * /home/meshpulse/deploy/downloads
+		file_server
+	}
+
 	reverse_proxy /agent/ws 127.0.0.1:3000
 	reverse_proxy 127.0.0.1:3000
 }

@@ -59,6 +59,12 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
           await this.agentService.selectNodesForCheck({
             activeNodeIds: this.agentGateway.listActiveNodeIds(),
             requiredRegion: checkDefinition.requiredRegion,
+            minReputation: checkDefinition.minReputation,
+            maxReputation: checkDefinition.maxReputation,
+            preferTrusted: checkDefinition.preferTrusted,
+            requireTrusted: checkDefinition.requireTrusted,
+            preferDifferentAsn: checkDefinition.preferDifferentAsn,
+            preferDifferentRegion: checkDefinition.preferDifferentRegion,
             limit: 1
           })
         )[0];
@@ -88,6 +94,8 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
             status: 'assigned'
           }
         });
+
+        await this.agentService.recordAssignmentDispatch(selectedNode.nodeId);
 
         this.logger.log(
           `primary assignment created executionId=${execution.id} assignmentId=${assignment.id} nodeId=${selectedNode.nodeId}`

@@ -16,11 +16,42 @@ import {
   AGENT_RESULTS_QUEUE
 } from '../queues/queue.constants';
 import { ChallengeStoreService } from '../security/challenge-store.service';
+import { ConnectionMetadata } from '../security/ip-geo.service';
+import { NodeSessionStoreService } from '../security/node-session-store.service';
 import {
   verifyClaimToken,
   verifyNodeSignature
 } from '../security/crypto.utils';
 import { ServerKeysService } from '../security/server-keys.service';
+
+type NodeSelectionParams = {
+  activeNodeIds: string[];
+  limit: number;
+  requiredRegion?: string | null;
+  minReputation?: number | null;
+  maxReputation?: number | null;
+  preferTrusted?: boolean;
+  requireTrusted?: boolean;
+  preferDifferentAsn?: boolean;
+  preferDifferentRegion?: boolean;
+  excludeNodeIds?: string[];
+  usedRemoteIps?: string[];
+  usedAsns?: number[];
+  usedRegions?: string[];
+};
+
+type RankedNode = {
+  nodeId: string;
+  remoteIp: string | null;
+  asn: number | null;
+  regionCode: string | null;
+  activeAssignments: number;
+  checksToday: number;
+  checksLastHour: number;
+  lastAssignedAt: number | null;
+  score: number;
+  reasons: string[];
+};
 
 @Injectable()
 export class AgentService {
@@ -30,6 +61,7 @@ export class AgentService {
     private readonly prisma: PrismaService,
     private readonly challengeStore: ChallengeStoreService,
     private readonly serverKeys: ServerKeysService,
+    private readonly nodeSessionStore: NodeSessionStoreService,
     @InjectQueue(AGENT_RESULTS_QUEUE)
     private readonly agentResultsQueue: Queue
   ) {}
@@ -84,7 +116,7 @@ export class AgentService {
         nodeId
       },
       data: {
-        status: 'active',
+        status: 'offline',
         isOnline: false,
         publicKey,
         hardwareRaw: hardware as Prisma.InputJsonValue | undefined,
@@ -119,8 +151,8 @@ export class AgentService {
       }
     });
 
-    if (!node || node.status !== 'active') {
-      throw new UnauthorizedException(`node ${nodeId} is not active`);
+    if (!node || node.status !== 'online') {
+      throw new UnauthorizedException(`node ${nodeId} is not online`);
     }
 
     const job = await this.claimPendingJob(nodeId);
@@ -182,16 +214,31 @@ export class AgentService {
     await this.verifyChallengeForNode(nodeId, signature, 'ws-auth');
   }
 
-  async markNodeOnline(nodeId: string) {
+  async markNodeOnline(nodeId: string, metadata: ConnectionMetadata) {
+    const connectedAt = new Date();
+
     await this.prisma.node.update({
       where: {
         nodeId
       },
       data: {
+        status: 'online',
         isOnline: true,
-        lastSeenAt: new Date()
+        remoteIp: metadata.remoteIp ?? undefined,
+        ipVersion: metadata.ipVersion ?? undefined,
+        countryCode: metadata.countryCode ?? undefined,
+        regionCode: metadata.regionCode ?? undefined,
+        city: metadata.city ?? undefined,
+        asn: metadata.asn ?? undefined,
+        ispOrOrg: metadata.ispOrOrg ?? undefined,
+        connectedAt,
+        lastSeenAt: connectedAt
       }
     });
+    this.logger.log(
+      `node DB updated nodeId=${nodeId} remoteIp=${metadata.remoteIp ?? 'unknown'} countryCode=${metadata.countryCode ?? 'n/a'} regionCode=${metadata.regionCode ?? 'n/a'}`
+    );
+    await this.nodeSessionStore.setOnline(nodeId, metadata, connectedAt);
   }
 
   async markNodeOffline(nodeId: string) {
@@ -200,9 +247,13 @@ export class AgentService {
         nodeId
       },
       data: {
-        isOnline: false
+        status: 'offline',
+        isOnline: false,
+        lastSeenAt: new Date()
       }
     });
+    this.logger.log(`node DB updated nodeId=${nodeId} status=offline`);
+    await this.nodeSessionStore.setOffline(nodeId);
   }
 
   async touchNode(nodeId: string) {
@@ -211,10 +262,12 @@ export class AgentService {
         nodeId
       },
       data: {
+        status: 'online',
         isOnline: true,
         lastSeenAt: new Date()
       }
     });
+    await this.nodeSessionStore.touch(nodeId);
   }
 
   async markJobRunning(jobId: string, nodeId: string) {
@@ -350,9 +403,7 @@ export class AgentService {
     const dispatches =
       assignment.role === 'primary'
         ? await this.maybeCreateValidationAssignments(
-            assignment.execution.checkDefinitionId,
             executionId,
-            assignment.nodeId,
             resultStatus,
             activeNodeIds
           )
@@ -429,9 +480,7 @@ export class AgentService {
   }
 
   private async maybeCreateValidationAssignments(
-    checkDefinitionId: string,
     executionId: string,
-    primaryNodeId: string,
     resultStatus: string,
     activeNodeIds: string[]
   ) {
@@ -463,14 +512,23 @@ export class AgentService {
     }
 
     this.logger.log(
-      `validation triggered executionId=${executionId} checkDefinitionId=${checkDefinitionId} primaryNodeId=${primaryNodeId} resultStatus=${resultStatus}`
+      `validation triggered executionId=${executionId} checkDefinitionId=${execution.checkDefinitionId} primaryNodeId=${execution.assignments.find((entry) => entry.role === 'primary')?.nodeId ?? 'unknown'} resultStatus=${resultStatus}`
     );
 
-    const excludedNodeIds = execution.assignments.map((assignment) => assignment.nodeId);
+    const selectionContext = await this.getExecutionSelectionContext(executionId);
     const selectedNodes = await this.selectNodesForCheck({
       activeNodeIds,
-      excludeNodeIds: excludedNodeIds,
+      excludeNodeIds: selectionContext.usedNodeIds,
       requiredRegion: checkDefinition.requiredRegion,
+      minReputation: checkDefinition.minReputation,
+      maxReputation: checkDefinition.maxReputation,
+      preferTrusted: checkDefinition.preferTrusted,
+      requireTrusted: checkDefinition.requireTrusted,
+      preferDifferentAsn: checkDefinition.preferDifferentAsn,
+      preferDifferentRegion: checkDefinition.preferDifferentRegion,
+      usedRemoteIps: selectionContext.usedRemoteIps,
+      usedAsns: selectionContext.usedAsns,
+      usedRegions: selectionContext.usedRegions,
       limit: checkDefinition.validationCount
     });
 
@@ -500,6 +558,12 @@ export class AgentService {
       )
     );
 
+    await Promise.all(
+      createdAssignments.map((assignment) =>
+        this.touchAssignmentPressure(assignment.nodeId)
+      )
+    );
+
     this.logger.log(
       `validation assignments created executionId=${executionId} count=${createdAssignments.length}`
     );
@@ -514,13 +578,22 @@ export class AgentService {
     }));
   }
 
-  async selectNodesForCheck(params: {
-    activeNodeIds: string[];
-    excludeNodeIds?: string[];
-    requiredRegion?: string | null;
-    limit: number;
-  }) {
-    const { activeNodeIds, excludeNodeIds = [], requiredRegion, limit } = params;
+  async selectNodesForCheck(params: NodeSelectionParams) {
+    const {
+      activeNodeIds,
+      excludeNodeIds = [],
+      requiredRegion,
+      minReputation,
+      maxReputation,
+      preferTrusted = false,
+      requireTrusted = false,
+      preferDifferentAsn = true,
+      preferDifferentRegion = false,
+      usedRemoteIps = [],
+      usedAsns = [],
+      usedRegions = [],
+      limit
+    } = params;
 
     if (activeNodeIds.length === 0 || limit <= 0) {
       return [];
@@ -532,59 +605,153 @@ export class AgentService {
           in: activeNodeIds,
           notIn: excludeNodeIds
         },
-        status: 'active',
+        status: 'online',
         isOnline: true,
-        ...(requiredRegion ? { region: requiredRegion } : {})
+        ...(requiredRegion
+          ? {
+              OR: [{ region: requiredRegion }, { regionCode: requiredRegion }]
+            }
+          : {}),
+        ...(minReputation !== undefined && minReputation !== null
+          ? {
+              reputationScore: {
+                gte: minReputation
+              }
+            }
+          : {}),
+        ...(maxReputation !== undefined && maxReputation !== null
+          ? {
+              reputationScore: {
+                ...(minReputation !== undefined && minReputation !== null
+                  ? { gte: minReputation }
+                  : {}),
+                lte: maxReputation
+              }
+            }
+          : {}),
+        ...(requireTrusted ? { isTrusted: true } : {})
       },
       select: {
         nodeId: true,
-        lastSeenAt: true
+        lastSeenAt: true,
+        lastAssignedAt: true,
+        reputationScore: true,
+        isTrusted: true,
+        remoteIp: true,
+        asn: true,
+        regionCode: true
       }
     });
 
+    this.logger.log(
+      `eligibility filtering activeCandidates=${candidateNodes.length} requiredRegion=${requiredRegion ?? 'none'} minReputation=${minReputation ?? 'none'} maxReputation=${maxReputation ?? 'none'} requireTrusted=${requireTrusted}`
+    );
+
     const rankedNodes = await Promise.all(
       candidateNodes.map(async (node) => {
-        const [activeAssignments, latestAssignment] = await Promise.all([
+        const activeAssignments = await this.prisma.checkAssignment.count({
+          where: {
+            nodeId: node.nodeId,
+            status: {
+              in: ['assigned', 'running']
+            }
+          }
+        });
+
+        const [checksLastHour, dailyLoad] = await Promise.all([
           this.prisma.checkAssignment.count({
             where: {
               nodeId: node.nodeId,
-              status: {
-                in: ['assigned', 'running']
+              createdAt: {
+                gte: new Date(Date.now() - 60 * 60 * 1000)
               }
             }
           }),
-          this.prisma.checkAssignment.findFirst({
+          this.prisma.checkAssignment.count({
             where: {
-              nodeId: node.nodeId
-            },
-            orderBy: {
-              createdAt: 'desc'
-            },
-            select: {
-              createdAt: true
+              nodeId: node.nodeId,
+              createdAt: {
+                gte: this.getUtcDayStart()
+              }
             }
           })
         ]);
 
+        const score = this.calculateNodeSelectionScore(
+          {
+            ...node,
+            activeAssignments,
+            checksToday: dailyLoad,
+            checksLastHour
+          },
+          {
+            preferTrusted,
+            preferDifferentAsn,
+            preferDifferentRegion,
+            usedRemoteIps,
+            usedAsns,
+            usedRegions
+          }
+        );
+
         return {
           nodeId: node.nodeId,
-          lastSeenAt: node.lastSeenAt?.getTime() ?? 0,
+          remoteIp: node.remoteIp,
+          asn: node.asn,
+          regionCode: node.regionCode,
           activeAssignments,
-          lastAssignedAt: latestAssignment?.createdAt.getTime() ?? 0
-        };
+          checksToday: dailyLoad,
+          checksLastHour,
+          lastAssignedAt: node.lastAssignedAt?.getTime() ?? null,
+          score: score.score,
+          reasons: score.reasons
+        } satisfies RankedNode;
       })
     );
 
-    return rankedNodes
-      .filter((node) => node.activeAssignments === 0)
+    const eligibleNodes = rankedNodes.filter((node) => {
+      const overloaded = node.activeAssignments > 0;
+      if (overloaded) {
+        this.logger.log(
+          `eligibility filtering nodeId=${node.nodeId} rejected=overloaded activeAssignments=${node.activeAssignments}`
+        );
+      }
+      return !overloaded;
+    });
+
+    eligibleNodes.forEach((node) => {
+      this.logger.log(
+        `trusted preference decisions nodeId=${node.nodeId} score=${node.score} trusted=${node.reasons.filter((reason) => reason.startsWith('trusted')).join('|') || 'none'}`
+      );
+      this.logger.log(
+        `ASN preference decisions nodeId=${node.nodeId} score=${node.score} asn=${node.asn ?? 'n/a'} reason=${node.reasons.filter((reason) => reason.startsWith('asn') || reason.startsWith('remoteIp')).join('|') || 'none'}`
+      );
+      this.logger.log(
+        `region preference decisions nodeId=${node.nodeId} score=${node.score} regionCode=${node.regionCode ?? 'n/a'} reason=${node.reasons.filter((reason) => reason.startsWith('region')).join('|') || 'none'}`
+      );
+      this.logger.log(
+        `fairness decisions nodeId=${node.nodeId} score=${node.score} checksToday=${node.checksToday} checksLastHour=${node.checksLastHour} lastAssignedAt=${node.lastAssignedAt ?? 0}`
+      );
+    });
+
+    return eligibleNodes
       .sort((left, right) => {
-        if (left.lastAssignedAt !== right.lastAssignedAt) {
-          return left.lastAssignedAt - right.lastAssignedAt;
+        if (left.score !== right.score) {
+          return right.score - left.score;
+        }
+        const leftAssigned = left.lastAssignedAt ?? 0;
+        const rightAssigned = right.lastAssignedAt ?? 0;
+        if (leftAssigned !== rightAssigned) {
+          return leftAssigned - rightAssigned;
         }
 
-        return right.lastSeenAt - left.lastSeenAt;
+        return left.nodeId.localeCompare(right.nodeId);
       })
       .slice(0, limit);
+  }
+
+  async recordAssignmentDispatch(nodeId: string) {
+    await this.touchAssignmentPressure(nodeId);
   }
 
   async finalizeExecutionIfReady(executionId: string) {
@@ -604,6 +771,10 @@ export class AgentService {
 
     if (hasPendingAssignments) {
       return null;
+    }
+
+    if (execution.status === 'completed') {
+      return execution.consensusStatus;
     }
 
     const upCount = execution.results.filter((result) => result.status === 'up').length;
@@ -630,7 +801,289 @@ export class AgentService {
       `consensus decision executionId=${executionId} consensusStatus=${consensusStatus} upCount=${upCount} downCount=${downCount}`
     );
 
+    await this.applyReputationForExecution(executionId, consensusStatus);
+
     return consensusStatus;
+  }
+
+  private calculateNodeSelectionScore(
+    node: {
+      nodeId: string;
+      isTrusted: boolean;
+      remoteIp: string | null;
+      asn: number | null;
+      regionCode: string | null;
+      reputationScore: number;
+      checksToday: number;
+      checksLastHour: number;
+      lastAssignedAt: Date | null;
+      activeAssignments: number;
+    },
+    preferences: {
+      preferTrusted: boolean;
+      preferDifferentAsn: boolean;
+      preferDifferentRegion: boolean;
+      usedRemoteIps: string[];
+      usedAsns: number[];
+      usedRegions: string[];
+    }
+  ) {
+    let score = 0;
+    const reasons: string[] = [];
+    const uniqueRemoteIps = new Set(preferences.usedRemoteIps.filter(Boolean));
+    const uniqueAsns = new Set(preferences.usedAsns);
+    const uniqueRegions = new Set(preferences.usedRegions.filter(Boolean));
+
+    if (preferences.preferTrusted && node.isTrusted) {
+      score += 25;
+      reasons.push('trusted:+25');
+    } else if (preferences.preferTrusted) {
+      reasons.push('trusted:+0');
+    }
+
+    if (node.remoteIp && uniqueRemoteIps.has(node.remoteIp)) {
+      score -= 1000;
+      reasons.push('remoteIp:-1000');
+    }
+
+    if (preferences.preferDifferentAsn && node.asn !== null) {
+      if (uniqueAsns.size > 0 && uniqueAsns.has(node.asn)) {
+        score -= 35;
+        reasons.push('asn:-35');
+      } else if (uniqueAsns.size > 0) {
+        score += 20;
+        reasons.push('asn:+20');
+      }
+    }
+
+    if (preferences.preferDifferentRegion && node.regionCode) {
+      if (uniqueRegions.size > 0 && uniqueRegions.has(node.regionCode)) {
+        score -= 10;
+        reasons.push('region:-10');
+      } else if (uniqueRegions.size > 0) {
+        score += 10;
+        reasons.push('region:+10');
+      }
+    }
+
+    const lastAssignedAt = node.lastAssignedAt?.getTime() ?? 0;
+    const minutesSinceLastAssignment = lastAssignedAt
+      ? Math.max(0, (Date.now() - lastAssignedAt) / 60_000)
+      : 1_440;
+    const fairnessFromRecency = Math.min(20, Math.floor(minutesSinceLastAssignment / 5));
+    const fairnessFromDailyLoad = Math.max(0, 15 - node.checksToday * 2);
+    const fairnessFromHourlyLoad = Math.max(0, 20 - node.checksLastHour * 5);
+    const reputationBonus = Math.max(0, Math.floor(node.reputationScore / 10));
+
+    score += fairnessFromRecency + fairnessFromDailyLoad + fairnessFromHourlyLoad + reputationBonus;
+    reasons.push(
+      `fairness:+${fairnessFromRecency + fairnessFromDailyLoad + fairnessFromHourlyLoad}`,
+      `reputation:+${reputationBonus}`
+    );
+
+    return {
+      score,
+      reasons
+    };
+  }
+
+  private async getExecutionSelectionContext(executionId: string) {
+    const assignments = await this.prisma.checkAssignment.findMany({
+      where: {
+        executionId
+      },
+      include: {
+        node: {
+          select: {
+            nodeId: true,
+            remoteIp: true,
+            asn: true,
+            regionCode: true
+          }
+        }
+      }
+    });
+
+    return {
+      usedNodeIds: assignments.map((assignment) => assignment.nodeId),
+      usedRemoteIps: assignments
+        .map((assignment) => assignment.node.remoteIp)
+        .filter((value): value is string => Boolean(value)),
+      usedAsns: assignments
+        .map((assignment) => assignment.node.asn)
+        .filter((value): value is number => value !== null),
+      usedRegions: assignments
+        .map((assignment) => assignment.node.regionCode)
+        .filter((value): value is string => Boolean(value))
+    };
+  }
+
+  private async touchAssignmentPressure(nodeId: string) {
+    const now = new Date();
+    const [checksToday, checksLastHour] = await Promise.all([
+      this.prisma.checkAssignment.count({
+        where: {
+          nodeId,
+          createdAt: {
+            gte: this.getUtcDayStart()
+          }
+        }
+      }),
+      this.prisma.checkAssignment.count({
+        where: {
+          nodeId,
+          createdAt: {
+            gte: new Date(Date.now() - 60 * 60 * 1000)
+          }
+        }
+      })
+    ]);
+
+    await this.prisma.node.update({
+      where: {
+        nodeId
+      },
+      data: {
+        lastAssignedAt: now,
+        checksToday,
+        checksLastHour
+      }
+    });
+  }
+
+  private getUtcDayStart() {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  }
+
+  private async applyReputationForExecution(
+    executionId: string,
+    consensusStatus: string
+  ) {
+    if (!['up', 'down'].includes(consensusStatus)) {
+      return;
+    }
+
+    const execution = await this.prisma.checkExecution.findUniqueOrThrow({
+      where: {
+        id: executionId
+      },
+      include: {
+        results: true,
+        assignments: true
+      }
+    });
+
+    const assignmentById = new Map(
+      execution.assignments.map((assignment) => [assignment.id, assignment])
+    );
+
+    for (const result of execution.results) {
+      const assignment = assignmentById.get(result.assignmentId);
+      if (!assignment) {
+        continue;
+      }
+
+      const scoreDelta = result.status === consensusStatus ? 1 : -3;
+      const node = await this.prisma.node.findUniqueOrThrow({
+        where: {
+          nodeId: result.nodeId
+        }
+      });
+      const nextScore = Math.min(100, Math.max(0, node.reputationScore + scoreDelta));
+      if (nextScore !== node.reputationScore + scoreDelta) {
+        this.logger.log(
+          `score clamping nodeId=${result.nodeId} previous=${node.reputationScore} attempted=${node.reputationScore + scoreDelta} next=${nextScore}`
+        );
+      }
+
+      await this.prisma.$transaction(async (tx) => {
+        const existingEvent = await tx.nodeReputationEvent.findFirst({
+          where: {
+            assignmentId: result.assignmentId,
+            eventType:
+              result.status === consensusStatus
+                ? 'consensus_match'
+                : 'consensus_mismatch'
+          }
+        });
+
+        if (existingEvent) {
+          this.logger.log(
+            `reputation score changes skipped assignmentId=${result.assignmentId} eventType=${existingEvent.eventType} reason=already_recorded`
+          );
+          return;
+        }
+
+        await tx.node.update({
+          where: {
+            nodeId: result.nodeId
+          },
+          data: {
+            reputationScore: nextScore
+          }
+        });
+
+        await tx.nodeReputationEvent.create({
+          data: {
+            nodeId: result.nodeId,
+            executionId,
+            assignmentId: result.assignmentId,
+            eventType: result.status === consensusStatus ? 'consensus_match' : 'consensus_mismatch',
+            scoreDelta: nextScore - node.reputationScore,
+            reason: `result ${result.status} vs consensus ${consensusStatus}`
+          }
+        });
+      });
+
+      if (assignment.role === 'validation') {
+        await this.updateValidationAccuracy(result.nodeId);
+      }
+
+      this.logger.log(
+        `reputation score changes nodeId=${result.nodeId} executionId=${executionId} assignmentId=${result.assignmentId} scoreDelta=${nextScore - node.reputationScore} reputationScore=${nextScore}`
+      );
+    }
+  }
+
+  private async updateValidationAccuracy(nodeId: string) {
+    const results = await this.prisma.checkResult.findMany({
+      where: {
+        nodeId,
+        assignment: {
+          role: 'validation'
+        },
+        execution: {
+          consensusStatus: {
+            in: ['up', 'down']
+          }
+        }
+      },
+      include: {
+        execution: {
+          select: {
+            consensusStatus: true
+          }
+        }
+      }
+    });
+
+    if (results.length === 0) {
+      return;
+    }
+
+    const matches = results.filter(
+      (result) => result.status === result.execution.consensusStatus
+    ).length;
+
+    await this.prisma.node.update({
+      where: {
+        nodeId
+      },
+      data: {
+        validationAccuracy: matches / results.length
+      }
+    });
   }
 
   private requireNodeId(body: Record<string, unknown>) {
@@ -707,8 +1160,12 @@ export class AgentService {
       }
     });
 
-    if (!node || node.status !== 'active' || !node.publicKey) {
-      throw new UnauthorizedException(`node ${nodeId} is not active`);
+    if (
+      !node ||
+      !['offline', 'online'].includes(node.status) ||
+      !node.publicKey
+    ) {
+      throw new UnauthorizedException(`node ${nodeId} is not registered`);
     }
 
     return node;

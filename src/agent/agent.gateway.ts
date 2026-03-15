@@ -5,13 +5,19 @@ import {
   WebSocketGateway
 } from '@nestjs/websockets';
 import { Injectable, Logger } from '@nestjs/common';
+import { IncomingMessage } from 'node:http';
+import { isIP } from 'node:net';
 import WebSocket from 'ws';
 
 import { AgentService } from './agent.service';
+import { ConnectionMetadata, IpGeoService } from '../security/ip-geo.service';
 
 type SessionState = {
   authenticated: boolean;
   nodeId?: string;
+  remoteIp: string | null;
+  ipVersion: number | null;
+  connectionMetadata?: ConnectionMetadata;
 };
 
 type AgentMessage = {
@@ -39,7 +45,10 @@ export class AgentGateway
   private readonly sessions = new Map<WebSocket, SessionState>();
   private readonly activeSockets = new Map<string, WebSocket>();
 
-  constructor(private readonly agentService: AgentService) {}
+  constructor(
+    private readonly agentService: AgentService,
+    private readonly ipGeoService: IpGeoService
+  ) {}
 
   afterInit() {
     this.logger.log('agent gateway ready path=/agent/ws');
@@ -109,11 +118,22 @@ export class AgentGateway
     } as const;
   }
 
-  handleConnection(client: WebSocket) {
+  handleConnection(client: WebSocket, request: IncomingMessage) {
+    const remoteIp = this.ipGeoService.detectRemoteIp(
+      request.headers as Record<string, unknown>,
+      request.socket.remoteAddress
+    );
+    const ipVersion = remoteIp ? isIP(remoteIp) : null;
+
     this.sessions.set(client, {
-      authenticated: false
+      authenticated: false,
+      remoteIp,
+      ipVersion
     });
     this.logger.log('socket connected');
+    this.logger.log(
+      `remote IP detected remoteIp=${remoteIp ?? 'unknown'} ipVersion=${ipVersion ?? 'unknown'}`
+    );
 
     client.on('message', (raw) => {
       void this.handleRawMessage(client, raw.toString());
@@ -133,6 +153,7 @@ export class AgentGateway
     if (trackedSocket === client) {
       this.activeSockets.delete(session.nodeId);
       await this.agentService.markNodeOffline(session.nodeId);
+      this.logger.log(`node marked offline on disconnect nodeId=${session.nodeId}`);
     }
 
     this.logger.log(`socket disconnected nodeId=${session.nodeId}`);
@@ -198,9 +219,13 @@ export class AgentGateway
 
     try {
       const challenge = await this.agentService.issueWsAuthChallenge(nodeId);
+      const currentSession = this.sessions.get(client);
       this.sessions.set(client, {
         authenticated: false,
-        nodeId
+        nodeId,
+        remoteIp: currentSession?.remoteIp ?? null,
+        ipVersion: currentSession?.ipVersion ?? null,
+        connectionMetadata: currentSession?.connectionMetadata
       });
 
       this.send(client, {
@@ -244,12 +269,19 @@ export class AgentGateway
       }
 
       this.activeSockets.set(nodeId, client);
+      const connectionMetadata = await this.ipGeoService.lookup(session.remoteIp);
+      this.logger.log(
+        `geo lookup result nodeId=${nodeId} remoteIp=${connectionMetadata.remoteIp ?? 'unknown'} countryCode=${connectionMetadata.countryCode ?? 'n/a'} regionCode=${connectionMetadata.regionCode ?? 'n/a'} city=${connectionMetadata.city ?? 'n/a'} asn=${connectionMetadata.asn ?? 'n/a'} ispOrOrg=${connectionMetadata.ispOrOrg ?? 'n/a'}`
+      );
       this.sessions.set(client, {
         authenticated: true,
-        nodeId
+        nodeId,
+        remoteIp: session.remoteIp,
+        ipVersion: session.ipVersion,
+        connectionMetadata
       });
 
-      await this.agentService.markNodeOnline(nodeId);
+      await this.agentService.markNodeOnline(nodeId, connectionMetadata);
       this.send(client, {
         type: 'auth_ok'
       });
