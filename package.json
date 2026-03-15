@@ -5,6 +5,7 @@
   "description": "Initial backend for the MeshPulse distributed monitoring system",
   "scripts": {
     "build": "nest build",
+    "dev": "nest start --watch",
     "prisma:migrate:deploy": "prisma migrate deploy",
     "prisma:migrate:dev": "prisma migrate dev",
     "prisma:migrate:status": "prisma migrate status",

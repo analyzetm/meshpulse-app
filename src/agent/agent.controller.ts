@@ -7,13 +7,23 @@ export class AgentController {
   constructor(private readonly agentService: AgentService) {}
 
   @Post('register')
-  register() {
-    return this.agentService.registerNode();
+  register(@Body() body: Record<string, unknown>) {
+    return this.agentService.registerNode(body);
+  }
+
+  @Post('auth/challenge')
+  issueChallenge(@Body() body: Record<string, unknown>) {
+    return this.agentService.issueAuthChallenge(body);
+  }
+
+  @Post('auth/verify')
+  verifyChallenge(@Body() body: Record<string, unknown>) {
+    return this.agentService.verifyAuthChallenge(body);
   }
 
   @Post('jobs/pull')
-  pullJob() {
-    return this.agentService.pullJob();
+  pullJob(@Body() body: Record<string, unknown>) {
+    return this.agentService.pullJob(body);
   }
 
   @Post('jobs/result')

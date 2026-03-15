@@ -8,13 +8,23 @@ datasource db {
 }
 
 model Node {
-  id         String      @id @default(uuid()) @db.Uuid
-  nodeKey    String?
-  version    String?
-  status     String      @default("online")
-  createdAt  DateTime    @default(now())
-  lastSeenAt DateTime?
-  results    JobResult[]
+  id                    String      @id @default(uuid()) @db.Uuid
+  nodeId                String      @unique
+  ownerUserId           String?
+  status                String      @default("pending_registration")
+  claimTokenHash        String?
+  claimTokenUsedAt      DateTime?
+  publicKey             String?
+  serverPublicKeySentAt DateTime?
+  activatedAt           DateTime?
+  lastSeenAt            DateTime?
+  agentVersion          String?
+  hardwareRaw           Json?
+  hardwareFingerprint   String?
+  region                String?
+  reputationScore       Int         @default(0)
+  createdAt             DateTime    @default(now())
+  results               JobResult[]
 
   @@map("nodes")
 }
@@ -25,7 +35,7 @@ model Job {
   target         String
   status         String      @default("pending")
   createdAt      DateTime    @default(now())
-  assignedNodeId String?     @db.Uuid
+  assignedNodeId String?
   results        JobResult[]
 
   @@map("jobs")
@@ -34,12 +44,12 @@ model Job {
 model JobResult {
   id        String   @id @default(uuid()) @db.Uuid
   jobId     String   @db.Uuid
-  nodeId    String   @db.Uuid
+  nodeId    String
   status    String
   latencyMs Int?
   createdAt DateTime @default(now())
   job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  node      Node     @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  node      Node     @relation(fields: [nodeId], references: [nodeId], onDelete: Cascade)
 
   @@map("job_results")
 }

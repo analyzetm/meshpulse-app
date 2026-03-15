@@ -6,10 +6,12 @@ import { AgentModule } from './agent/agent.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { AgentResultsProcessor } from './queues/agent-results.processor';
 import { AGENT_RESULTS_QUEUE } from './queues/queue.constants';
+import { SecurityModule } from './security/security.module';
 
 @Module({
   imports: [
     PrismaModule,
+    SecurityModule,
     BullModule.forRoot({
       connection: {
         host: process.env.REDIS_HOST ?? 'localhost',

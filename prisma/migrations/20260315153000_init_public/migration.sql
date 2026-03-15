@@ -1,23 +1,5 @@
--- DropForeignKey
-ALTER TABLE "meshpulse"."job_results" DROP CONSTRAINT "job_results_jobId_fkey";
-
--- DropForeignKey
-ALTER TABLE "meshpulse"."job_results" DROP CONSTRAINT "job_results_nodeId_fkey";
-
--- DropTable
-DROP TABLE "meshpulse"."job_results";
-
--- DropTable
-DROP TABLE "meshpulse"."jobs";
-
--- DropTable
-DROP TABLE "meshpulse"."nodes";
-
--- DropEnum
-DROP TYPE "meshpulse"."JobStatus";
-
 -- CreateTable
-CREATE TABLE "meshpulse"."nodes" (
+CREATE TABLE "nodes" (
     "id" UUID NOT NULL,
     "nodeKey" TEXT,
     "version" TEXT,
@@ -29,7 +11,7 @@ CREATE TABLE "meshpulse"."nodes" (
 );
 
 -- CreateTable
-CREATE TABLE "meshpulse"."jobs" (
+CREATE TABLE "jobs" (
     "id" UUID NOT NULL,
     "type" TEXT NOT NULL,
     "target" TEXT NOT NULL,
@@ -41,7 +23,7 @@ CREATE TABLE "meshpulse"."jobs" (
 );
 
 -- CreateTable
-CREATE TABLE "meshpulse"."job_results" (
+CREATE TABLE "job_results" (
     "id" UUID NOT NULL,
     "jobId" UUID NOT NULL,
     "nodeId" UUID NOT NULL,
@@ -53,7 +35,7 @@ CREATE TABLE "meshpulse"."job_results" (
 );
 
 -- AddForeignKey
-ALTER TABLE "meshpulse"."job_results" ADD CONSTRAINT "job_results_jobId_fkey" FOREIGN KEY ("jobId") REFERENCES "meshpulse"."jobs"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "job_results" ADD CONSTRAINT "job_results_jobId_fkey" FOREIGN KEY ("jobId") REFERENCES "jobs"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "meshpulse"."job_results" ADD CONSTRAINT "job_results_nodeId_fkey" FOREIGN KEY ("nodeId") REFERENCES "meshpulse"."nodes"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "job_results" ADD CONSTRAINT "job_results_nodeId_fkey" FOREIGN KEY ("nodeId") REFERENCES "nodes"("id") ON DELETE CASCADE ON UPDATE CASCADE;

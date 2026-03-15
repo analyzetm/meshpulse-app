@@ -1,0 +1,7 @@
+{
+	email Manuel.Kammermann@hotmail.de
+}
+
+api.pulseofmesh.app {
+	reverse_proxy 127.0.0.1:3000
+}

@@ -10,4 +10,9 @@ export class AdminController {
   createJob(@Body() body: Record<string, unknown>) {
     return this.adminService.createJob(body);
   }
+
+  @Post('nodes')
+  createNode(@Body() body: Record<string, unknown>) {
+    return this.adminService.createNode(body);
+  }
 }

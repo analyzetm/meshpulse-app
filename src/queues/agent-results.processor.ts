@@ -31,7 +31,7 @@ export class AgentResultsProcessor extends WorkerHost {
       const [node, persistedJob] = await Promise.all([
         this.prisma.node.findUnique({
           where: {
-            id: result.nodeId
+            nodeId: result.nodeId
           }
         }),
         this.prisma.job.findUnique({
@@ -63,11 +63,11 @@ export class AgentResultsProcessor extends WorkerHost {
       await Promise.all([
         this.prisma.node.update({
           where: {
-            id: result.nodeId
+            nodeId: result.nodeId
           },
           data: {
             lastSeenAt: new Date(),
-            status: 'online'
+            status: 'active'
           }
         }),
         this.prisma.job.update({
@@ -75,10 +75,12 @@ export class AgentResultsProcessor extends WorkerHost {
             id: result.jobId
           },
           data: {
-            status: result.status
+            status: 'finished'
           }
         })
       ]);
+
+      this.logger.log(`Marked job ${result.jobId} as finished`);
     } finally {
       this.logger.log(
         `Finished processing job ${job.id} from ${AGENT_RESULTS_QUEUE}`
