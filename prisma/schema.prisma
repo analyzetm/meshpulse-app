@@ -12,6 +12,7 @@ model Node {
   nodeId                String      @unique
   ownerUserId           String?
   status                String      @default("pending_registration")
+  isOnline              Boolean     @default(false)
   claimTokenHash        String?
   claimTokenUsedAt      DateTime?
   publicKey             String?

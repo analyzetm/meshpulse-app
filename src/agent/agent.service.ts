@@ -7,7 +7,7 @@ import {
   NotFoundException,
   UnauthorizedException
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Node, Prisma } from '@prisma/client';
 import { Queue } from 'bullmq';
 
 import { PrismaService } from '../prisma/prisma.service';
@@ -85,6 +85,7 @@ export class AgentService {
       },
       data: {
         status: 'active',
+        isOnline: false,
         publicKey,
         hardwareRaw: hardware as Prisma.InputJsonValue | undefined,
         agentVersion: agentVersion || undefined,
@@ -146,92 +147,74 @@ export class AgentService {
   }
 
   async issueAuthChallenge(body: Record<string, unknown>) {
-    const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : '';
-
-    if (!nodeId) {
-      throw new BadRequestException('nodeId is required');
-    }
-
-    const node = await this.prisma.node.findUnique({
-      where: {
-        nodeId
-      }
-    });
-
-    if (!node || node.status !== 'active' || !node.publicKey) {
-      throw new UnauthorizedException(`node ${nodeId} is not active`);
-    }
-
-    const challenge = await this.challengeStore.issueChallenge(nodeId);
-
-    await this.prisma.node.update({
-      where: {
-        nodeId
-      },
-      data: {
-        serverPublicKeySentAt: new Date()
-      }
-    });
-
-    this.logger.log(`Issued auth challenge for node ${nodeId}`);
+    const nodeId = this.requireNodeId(body);
+    const challenge = await this.issueChallengeForNode(nodeId, 'http-auth');
 
     return {
       ok: true,
-      challenge,
-      serverPublicKey: this.serverKeys.getPublicKey()
+      challenge: challenge.challenge,
+      serverPublicKey: challenge.serverPublicKey
     };
   }
 
   async verifyAuthChallenge(body: Record<string, unknown>) {
-    const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : '';
+    const nodeId = this.requireNodeId(body);
     const signature =
       typeof body.signature === 'string' ? body.signature.trim() : '';
 
-    if (!nodeId || !signature) {
+    if (!signature) {
       throw new BadRequestException('nodeId and signature are required');
     }
 
-    const node = await this.prisma.node.findUnique({
-      where: {
-        nodeId
-      }
-    });
-
-    if (!node || node.status !== 'active' || !node.publicKey) {
-      this.logger.warn(`Auth verify failed for node ${nodeId}`);
-      throw new UnauthorizedException(`node ${nodeId} is not active`);
-    }
-
-    const challenge = await this.challengeStore.getChallenge(nodeId);
-
-    if (!challenge) {
-      this.logger.warn(`Auth verify failed for node ${nodeId}`);
-      throw new UnauthorizedException('challenge not found or expired');
-    }
-
-    const verified = verifyNodeSignature(node.publicKey, challenge, signature);
-    await this.challengeStore.deleteChallenge(nodeId);
-
-    if (!verified) {
-      this.logger.warn(`Auth verify failed for node ${nodeId}`);
-      throw new UnauthorizedException('invalid signature');
-    }
-
-    await this.prisma.node.update({
-      where: {
-        nodeId
-      },
-      data: {
-        lastSeenAt: new Date()
-      }
-    });
-
-    this.logger.log(`Auth verify success for node ${nodeId}`);
+    await this.verifyChallengeForNode(nodeId, signature, 'http-auth');
 
     return {
       ok: true,
       authenticated: true
     };
+  }
+
+  async issueWsAuthChallenge(nodeId: string) {
+    return this.issueChallengeForNode(nodeId, 'ws-auth');
+  }
+
+  async verifyWsAuthChallenge(nodeId: string, signature: string) {
+    await this.verifyChallengeForNode(nodeId, signature, 'ws-auth');
+  }
+
+  async markNodeOnline(nodeId: string) {
+    await this.prisma.node.update({
+      where: {
+        nodeId
+      },
+      data: {
+        isOnline: true,
+        lastSeenAt: new Date()
+      }
+    });
+  }
+
+  async markNodeOffline(nodeId: string) {
+    await this.prisma.node.updateMany({
+      where: {
+        nodeId
+      },
+      data: {
+        isOnline: false
+      }
+    });
+  }
+
+  async touchNode(nodeId: string) {
+    await this.prisma.node.update({
+      where: {
+        nodeId
+      },
+      data: {
+        isOnline: true,
+        lastSeenAt: new Date()
+      }
+    });
   }
 
   async queueJobResult(payload: Record<string, unknown>) {
@@ -298,5 +281,86 @@ export class AgentService {
     }
 
     return null;
+  }
+
+  private requireNodeId(body: Record<string, unknown>) {
+    const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : '';
+
+    if (!nodeId) {
+      throw new BadRequestException('nodeId is required');
+    }
+
+    return nodeId;
+  }
+
+  private async issueChallengeForNode(
+    nodeId: string,
+    scope: 'http-auth' | 'ws-auth'
+  ) {
+    await this.getActiveNodeForAuth(nodeId);
+    const challenge = await this.challengeStore.issueChallenge(nodeId, scope);
+
+    await this.prisma.node.update({
+      where: {
+        nodeId
+      },
+      data: {
+        serverPublicKeySentAt: new Date()
+      }
+    });
+
+    this.logger.log(`Issued ${scope} challenge for node ${nodeId}`);
+
+    return {
+      challenge,
+      serverPublicKey: this.serverKeys.getPublicKey()
+    };
+  }
+
+  private async verifyChallengeForNode(
+    nodeId: string,
+    signature: string,
+    scope: 'http-auth' | 'ws-auth'
+  ) {
+    const node = await this.getActiveNodeForAuth(nodeId);
+    const challenge = await this.challengeStore.getChallenge(nodeId, scope);
+
+    if (!challenge) {
+      this.logger.warn(`Auth verify failed for node ${nodeId}`);
+      throw new UnauthorizedException('challenge not found or expired');
+    }
+
+    const verified = verifyNodeSignature(node.publicKey!, challenge, signature);
+    await this.challengeStore.deleteChallenge(nodeId, scope);
+
+    if (!verified) {
+      this.logger.warn(`Auth verify failed for node ${nodeId}`);
+      throw new UnauthorizedException('invalid signature');
+    }
+
+    await this.prisma.node.update({
+      where: {
+        nodeId
+      },
+      data: {
+        lastSeenAt: new Date()
+      }
+    });
+
+    this.logger.log(`Auth verify success for node ${nodeId}`);
+  }
+
+  private async getActiveNodeForAuth(nodeId: string): Promise<Node> {
+    const node = await this.prisma.node.findUnique({
+      where: {
+        nodeId
+      }
+    });
+
+    if (!node || node.status !== 'active' || !node.publicKey) {
+      throw new UnauthorizedException(`node ${nodeId} is not active`);
+    }
+
+    return node;
   }
 }

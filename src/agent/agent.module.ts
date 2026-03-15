@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
 
 import { AgentController } from './agent.controller';
+import { AgentGateway } from './agent.gateway';
 import { AgentService } from './agent.service';
 import { AGENT_RESULTS_QUEUE } from '../queues/queue.constants';
 
@@ -12,6 +13,6 @@ import { AGENT_RESULTS_QUEUE } from '../queues/queue.constants';
     })
   ],
   controllers: [AgentController],
-  providers: [AgentService]
+  providers: [AgentService, AgentGateway]
 })
 export class AgentModule {}
