@@ -7,6 +7,8 @@ Aktueller Schwerpunkt des Projekts:
 - persistente Agent-Sessions über WSS
 - wiederkehrende Checks per Scheduler
 - Primary-/Validation-Ausführung mit Konsensbildung
+- gewichtete Node-Auswahl mit Trust, Reputation und Fairness
+- serverseitige IP-/Geo-/ASN-Anreicherung via GeoLite2
 - Persistenz in PostgreSQL
 - operative Sichtbarkeit über SQL-Views
 
@@ -65,12 +67,26 @@ Ohne Argument startet der Agent automatisch im Modus `run`.
   - `nodeId`
   - `status`
   - `isOnline`
+  - `isTrusted`
+  - `trustLevel`
   - `publicKey`
   - `activatedAt`
   - `lastSeenAt`
+  - `connectedAt`
+  - `remoteIp`
+  - `ipVersion`
+  - `countryCode`
+  - `regionCode`
+  - `city`
+  - `asn`
+  - `ispOrOrg`
   - `hardwareRaw`
   - `region`
   - `reputationScore`
+  - `checksToday`
+  - `checksLastHour`
+  - `lastAssignedAt`
+  - `validationAccuracy`
 - `jobs`
 - `job_results`
 
@@ -86,6 +102,12 @@ Ohne Argument startet der Agent automatisch im Modus `run`.
   - `validationMode`
   - `validationCount`
   - optional `requiredRegion`
+  - optional `minReputation`
+  - optional `maxReputation`
+  - `preferTrusted`
+  - `requireTrusted`
+  - `preferDifferentAsn`
+  - `preferDifferentRegion`
   - `isActive`
   - `nextRunAt`
 - `check_executions`
@@ -100,6 +122,11 @@ Ohne Argument startet der Agent automatisch im Modus `run`.
   - Ergebnis pro Assignment
   - `status = up | down | timeout | error`
   - `latencyMs`
+- `node_reputation_events`
+  - nachvollziehbare Änderungen des `reputationScore`
+  - `eventType`
+  - `scoreDelta`
+  - `reason`
 
 ### SQL-Views
 
@@ -144,7 +171,8 @@ Wenn alle Assignments einer Execution abgeschlossen sind, berechnet das Backend 
 Node-Zustände:
 
 - `pending_registration`
-- `active`
+- `offline`
+- `online`
 
 Presence:
 
@@ -153,9 +181,22 @@ Presence:
 
 Ein Node muss für aktive Planung:
 
-- `status = active` haben
+- `status = online` haben
 - `isOnline = true` haben
 - eine aktive authentifizierte WSS-Session besitzen
+
+Bei erfolgreicher WSS-Authentifizierung reichert das Backend den Node zusätzlich an mit:
+
+- `remoteIp`
+- `ipVersion`
+- `countryCode`
+- `regionCode`
+- `city`
+- `asn`
+- `ispOrOrg`
+- `connectedAt`
+
+Diese Daten werden sowohl in PostgreSQL als auch als Live-Session in Redis gespeichert.
 
 ## Installation
 
@@ -177,6 +218,8 @@ REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 SERVER_KEY_PATH=.secrets/server-ed25519.json
 AUTH_CHALLENGE_TTL_SECONDS=300
+GEOLITE2_CITY_DB_PATH=.secrets/GeoLite2-City.mmdb
+GEOLITE2_ASN_DB_PATH=.secrets/GeoLite2-ASN.mmdb
 ```
 
 Bedeutung:
@@ -186,6 +229,8 @@ Bedeutung:
 - `REDIS_HOST`, `REDIS_PORT`: Redis für Challenges und BullMQ
 - `SERVER_KEY_PATH`: persistentes Server-Keypair
 - `AUTH_CHALLENGE_TTL_SECONDS`: Gültigkeit einer Auth-Challenge
+- `GEOLITE2_CITY_DB_PATH`: lokaler Pfad zur GeoLite2-City-MMDB
+- `GEOLITE2_ASN_DB_PATH`: lokaler Pfad zur GeoLite2-ASN-MMDB
 
 ### Backend starten
 
@@ -240,6 +285,14 @@ Aktuelles Verhalten:
 - `run`: vollständiger Betriebsmodus
 - ohne Argument: automatischer Fallback auf `run`
 
+### Linux-Binary per HTTPS
+
+Die veröffentlichte Linux-Version ist direkt downloadbar:
+
+```text
+https://api.pulseofmesh.app/downloads/meshpulse-agent-linux-amd64
+```
+
 ## Registrierungs- und Sitzungsfluss
 
 ### Registrierung
@@ -248,7 +301,8 @@ Aktuelles Verhalten:
 2. Der Agent erhält `NODE_ID` und `NODE_CLAIM_TOKEN`.
 3. Der Agent erzeugt lokal ein Ed25519-Keypair.
 4. Der Agent ruft `POST /agent/register` auf.
-5. Das Backend speichert Public Key und Hardwaredaten und setzt den Node auf `active`.
+5. Das Backend speichert Public Key und Hardwaredaten und setzt den Node auf `offline`.
+6. Beim ersten erfolgreichen WSS-Connect wird der Node auf `online` gesetzt.
 
 ### WSS-Authentifizierung
 
@@ -315,10 +369,12 @@ Ablauf pro fälliger `CheckDefinition`:
 
 1. `check_definitions.nextRunAt <= now`
 2. passende Nodes suchen:
-   - `status = active`
+   - `status = online`
    - `isOnline = true`
    - aktive WSS-Session
    - `requiredRegion` passend, falls gesetzt
+   - `reputationScore` passend, falls `minReputation` oder `maxReputation` gesetzt sind
+   - `isTrusted = true`, falls `requireTrusted = true`
    - Node nicht bereits durch laufende Check-Assignments belegt
 3. `check_execution` anlegen
 4. genau ein `check_assignment` mit `role = primary` anlegen
@@ -330,6 +386,48 @@ Wenn kein passender Node existiert:
 - es wird nichts gesendet
 - ein Logeintrag wird erzeugt
 - der Check wird im nächsten Scheduler-Zyklus erneut versucht
+
+## Gewichtete Node-Auswahl
+
+Die aktuelle Auswahl arbeitet in drei Stufen:
+
+1. harte Eligibility
+   - Node ist online
+   - aktive WSS-Session existiert
+   - `requiredRegion` passt, falls gesetzt
+   - Reputation erfüllt `minReputation` und `maxReputation`, falls gesetzt
+   - `requireTrusted = true` erzwingt `isTrusted = true`
+   - derselbe `nodeId` darf innerhalb derselben Execution nicht erneut gewählt werden
+2. gewichtete Präferenzen
+   - gleicher `remoteIp` bekommt einen sehr starken Malus
+   - gleiche `asn` bekommt einen moderaten Malus, falls ASN-Diversität bevorzugt wird
+   - andere `asn` bekommt einen Bonus
+   - andere Region bekommt einen Bonus, falls Regionsdiversität bevorzugt wird
+   - `preferTrusted = true` gibt Trusted-Nodes einen Bonus
+3. Fairness
+   - ältere `lastAssignedAt` werden bevorzugt
+   - niedrigere `checksToday`
+   - niedrigere `checksLastHour`
+   - zusätzlicher kleiner Bonus aus `reputationScore`
+
+ASN- und Regionsdiversität sind dabei bewusst keine harten Ausschlüsse. Das System soll auch in kleinen Netzen weiter planen können.
+
+## Reputation und Validation Accuracy
+
+Nach abgeschlossenem Konsens gilt aktuell:
+
+- Ergebnis entspricht dem Konsens -> `reputationScore +1`
+- Ergebnis widerspricht dem Konsens -> `reputationScore -3`
+- Clamp immer auf `0..100`
+
+Jede Änderung wird in `node_reputation_events` gespeichert.
+
+`validationAccuracy` wird nur für Assignments mit `role = validation` berechnet:
+
+- nur Executions mit eindeutigem Konsens `up` oder `down` zählen
+- `mixed` wird ignoriert
+- Formel:
+  - `validation_results_matching_consensus / all_validation_results_with_clear_consensus`
 
 ## Assignment- und Result-Protokoll
 
@@ -441,13 +539,22 @@ Beispiel:
   "target": "mymafi.app:443",
   "intervalSec": 60,
   "validationMode": "on_failure",
-  "validationCount": 2
+  "validationCount": 2,
+  "minReputation": 40,
+  "preferTrusted": true,
+  "preferDifferentAsn": true
 }
 ```
 
 Optional:
 
 - `requiredRegion`
+- `minReputation`
+- `maxReputation`
+- `preferTrusted`
+- `requireTrusted`
+- `preferDifferentAsn`
+- `preferDifferentRegion`
 
 Gültige `validationMode`-Werte:
 
@@ -500,6 +607,13 @@ Scheduler / Check-Flow:
 - `validation triggered`
 - `validation assignments created`
 - `consensus decision`
+- `eligibility filtering`
+- `trusted preference decisions`
+- `ASN preference decisions`
+- `region preference decisions`
+- `fairness decisions`
+- `reputation score changes`
+- `score clamping`
 
 WSS / Agent:
 
@@ -518,6 +632,9 @@ Persistenz:
 - `job result stored`
 - `job marked finished`
 - `check result stored`
+- `node DB updated`
+- `Redis session updated`
+- `node marked offline on disconnect`
 
 ## Datenbankabfragen
 
