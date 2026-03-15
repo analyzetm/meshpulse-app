@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
 
+import { AdminModule } from './admin/admin.module';
 import { AgentModule } from './agent/agent.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { AgentResultsProcessor } from './queues/agent-results.processor';
+import { AGENT_RESULTS_QUEUE } from './queues/queue.constants';
 
 @Module({
   imports: [
@@ -15,8 +17,9 @@ import { AgentResultsProcessor } from './queues/agent-results.processor';
       }
     }),
     BullModule.registerQueue({
-      name: 'agent-results'
+      name: AGENT_RESULTS_QUEUE
     }),
+    AdminModule,
     AgentModule
   ],
   providers: [AgentResultsProcessor]
